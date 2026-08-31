@@ -1,0 +1,469 @@
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+/// A class in the ontology, holding its own scalar properties and references
+/// to other classes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Vec<Property>,
+}
+
+/// A single property (datatype or object) attached to a node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Property {
+    pub name: String,
+    pub description: Option<String>,
+    pub range: PropertyRange,
+}
+
+/// Describes what a property points to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyRange {
+    /// A basic xsd scalar (e.g. `xsd:string`).
+    Scalar(String),
+    /// A reference to another class (the target's `Node.id`).
+    Reference(String),
+}
+
+/// A directed relationship between two nodes, derived from an object property.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edge {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub description: Option<String>,
+}
+
+/// The parsed ontology: a set of nodes and the edges between them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ontology {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+}
+
+#[derive(Debug, Error)]
+pub enum OntologyError {
+    #[error("failed to read '{0}': {1}")]
+    Read(String, #[source] std::io::Error),
+
+    #[error("invalid JSON-LD: {0}")]
+    InvalidJsonLd(String),
+
+    #[error("no '@graph' array found in ontology")]
+    MissingGraph,
+
+    #[error("ontology contains no nodes")]
+    EmptyOntology,
+
+    #[error("class '{0}' is missing a label")]
+    MissingLabel(String),
+
+    #[error("property '{0}' is missing a label")]
+    MissingPropertyLabel(String),
+
+    #[error("property '{property}' on class '{class}' references unknown class '{reference}'")]
+    UnknownReference {
+        property: String,
+        class: String,
+        reference: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Parsing (JSON-LD)
+// ---------------------------------------------------------------------------
+
+const RDFS_CLASS: &str = "rdfs:Class";
+const OWL_CLASS: &str = "owl:Class";
+const XSD_PREFIX: &str = "xsd:";
+
+impl Ontology {
+    /// Basic sanity check on the ontology.
+    pub fn validate(&self) -> Result<(), OntologyError> {
+        if self.nodes.is_empty() {
+            return Err(OntologyError::EmptyOntology);
+        }
+        Ok(())
+    }
+
+    /// Look up a node by its (short) name.
+    pub fn node(&self, name: &str) -> Option<&Node> {
+        self.nodes.iter().find(|node| node.name == name)
+    }
+
+    /// All node names, in order.
+    pub fn node_names(&self) -> Vec<&str> {
+        self.nodes.iter().map(|node| node.name.as_str()).collect()
+    }
+
+    /// All edge names, in order.
+    pub fn edge_names(&self) -> Vec<&str> {
+        self.edges.iter().map(|edge| edge.name.as_str()).collect()
+    }
+
+    /// Load the ontology from the default `ontology.jsonld` file.
+    pub fn load() -> Result<Self, OntologyError> {
+        Self::from_file("ontology.jsonld")
+    }
+
+    /// Load the ontology from a JSON-LD file on disk.
+    pub fn from_file(path: &str) -> Result<Self, OntologyError> {
+        let text =
+            std::fs::read_to_string(path).map_err(|err| OntologyError::Read(path.to_string(), err))?;
+        Self::from_jsonld_text(&text)
+    }
+
+    /// Parse an ontology from a JSON-LD string.
+    pub fn from_jsonld_text(text: &str) -> Result<Self, OntologyError> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|err| OntologyError::InvalidJsonLd(err.to_string()))?;
+        Self::from_jsonld(&value)
+    }
+
+    /// Parse an ontology from an already-parsed JSON-LD [`Value`].
+    pub fn from_jsonld(value: &Value) -> Result<Self, OntologyError> {
+        let root = value
+            .as_object()
+            .ok_or_else(|| OntologyError::InvalidJsonLd("root must be an object".to_string()))?;
+
+        let context = root.get("@context").and_then(Value::as_object);
+        let graph = root
+            .get("@graph")
+            .and_then(Value::as_array)
+            .ok_or(OntologyError::MissingGraph)?;
+
+        let resolver = PrefixResolver::new(context);
+
+        // First pass: collect class nodes.
+        let mut nodes = Vec::new();
+        for item in graph {
+            if is_class(item) {
+                nodes.push(parse_node(item, &resolver)?);
+            }
+        }
+
+        if nodes.is_empty() {
+            return Err(OntologyError::EmptyOntology);
+        }
+
+        let id_to_name: HashMap<&str, &str> = nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.name.as_str()))
+            .collect();
+
+        // Second pass: derive edges from reference-type properties, and map
+        // any free-standing object/datatype properties onto their domain class.
+        let (edges, properties) = build_properties_and_edges(graph, &resolver, &id_to_name)?;
+
+        // Attach domain-scoped properties to nodes.
+        for node in &mut nodes {
+            if let Some(props) = properties.get(&node.id) {
+                node.properties = props.clone();
+            }
+        }
+
+        Ok(Ontology { nodes, edges })
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema generation
+    // -----------------------------------------------------------------------
+
+    /// Convert the ontology into the flat keyed JSON schema form described in
+    /// `req.md` (one object property per node, with edges referencing the
+    /// other node by id instead of embedding the full object).
+    pub fn to_json(&self) -> Value {
+        let mut output: Map<String, Value> = Map::new();
+
+        // Node id helpers. A node named "Person" gets top-level key
+        // "NodePerson", an id field "personId", and an id definition
+        // "NodePersonId".
+        let node_key = |name: &str| format!("Node{name}");
+        let node_id_key = |name: &str| {
+            let first = name.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
+            format!("{first}{}Id", &name[name.len().min(first.len())..])
+        };
+
+        for node in &self.nodes {
+            let mut props: Map<String, Value> = Map::new();
+            props.insert("name".to_string(), json!({"type": "string"}));
+            props.insert("description".to_string(), json!({"type": "string"}));
+            props.insert(node_id_key(&node.name), json!({"type": "string"}));
+
+            for property in &node.properties {
+                match &property.range {
+                    PropertyRange::Scalar(xsd) => {
+                        props.insert(property.name.clone(), scalar_schema(xsd));
+                    }
+                    PropertyRange::Reference(target) => {
+                        if let Some(node) = self.nodes.iter().find(|n| n.id == *target) {
+                            // Edge carries the id of the target node rather
+                            // than the full object.
+                            props.insert(
+                                property.name.clone(),
+                                json!({
+                                    "type": "array",
+                                    "items": { "$ref": format!("#/{}", node_id_key(&node.name)) }
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            output.insert(
+                node_key(&node.name),
+                json!({ "type": "object", "properties": props }),
+            );
+        }
+
+        // Emit an id definition for each node so edges can resolve to it.
+        for node in &self.nodes {
+            output.insert(
+                node_id_key(&node.name),
+                json!({ "type": "string", "description": "id of the node" }),
+            );
+        }
+
+        Value::Object(output)
+    }
+
+    /// Convert the ontology into a pretty-printed JSON string.
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.to_json())
+    }
+}
+
+/// Resolves prefixed terms (e.g. `ex:Person`) to full IRIs and back to short names.
+struct PrefixResolver {
+    prefixes: HashMap<String, String>,
+    short_names: HashMap<String, String>,
+}
+
+impl PrefixResolver {
+    fn new(context: Option<&Map<String, Value>>) -> Self {
+        let mut resolver = PrefixResolver {
+            prefixes: HashMap::new(),
+            short_names: HashMap::new(),
+        };
+
+        let Some(context) = context else {
+            return resolver;
+        };
+
+        // First pass: collect prefix declarations. A term maps to a prefix only
+        // when its value is an absolute IRI (e.g. "ex": "https://example.com/").
+        for (key, val) in context {
+            if let Value::String(s) = val {
+                let is_prefix = key.split_once(':').is_none();
+                let is_absolute = s.starts_with("http") || s.starts_with("https");
+                if is_prefix && is_absolute {
+                    resolver
+                        .prefixes
+                        .insert(key.clone(), s.trim_end_matches('/').to_string() + "/");
+                }
+            }
+        }
+
+        // Second pass: resolve terms to full IRIs.
+        for (key, val) in context {
+            match val {
+                Value::String(s) => {
+                    if let Some(full) = resolver.expand(s) {
+                        resolver.short_names.insert(full, key.clone());
+                    }
+                }
+                Value::Object(obj) => {
+                    if let Some(id_str) = obj.get("@id").and_then(Value::as_str) {
+                        if let Some(full) = resolver.expand(id_str) {
+                            resolver.short_names.insert(full, key.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        resolver
+    }
+
+    fn expand(&self, term: &str) -> Option<String> {
+        term.split_once(':')
+            .and_then(|(prefix, local)| self.prefixes.get(prefix).map(|base| format!("{base}{local}")))
+    }
+
+    /// Expand `term` to a full IRI, falling back to the raw term.
+    fn resolve_iri(&self, term: &str) -> String {
+        self.expand(term).unwrap_or_else(|| term.to_string())
+    }
+
+    /// Resolve `term` to a short display name, falling back to the raw term.
+    fn resolve(&self, term: &str) -> String {
+        let iri = self.resolve_iri(term);
+        self.short_names
+            .get(&iri)
+            .cloned()
+            .unwrap_or_else(|| term.to_string())
+    }
+}
+
+fn is_class(item: &Value) -> bool {
+    match item.get("@type") {
+        Some(Value::String(value)) => value == RDFS_CLASS || value == OWL_CLASS,
+        Some(Value::Array(values)) => values.iter().any(|value| {
+            value.as_str() == Some(RDFS_CLASS) || value.as_str() == Some(OWL_CLASS)
+        }),
+        _ => false,
+    }
+}
+
+fn parse_node(item: &Value, resolver: &PrefixResolver) -> Result<Node, OntologyError> {
+    let id = resolver.resolve_iri(
+        item.get("@id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OntologyError::InvalidJsonLd("class missing '@id'".to_string()))?,
+    );
+
+    let name = item
+        .get("rdfs:label")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("@id")
+                .and_then(Value::as_str)
+                .map(|id| resolver.resolve(id))
+        })
+        .ok_or_else(|| OntologyError::MissingLabel(id.clone()))?;
+
+    let description = item.get("rdfs:comment").and_then(Value::as_str).map(str::to_string);
+
+    Ok(Node {
+        id,
+        name,
+        description,
+        properties: Vec::new(),
+    })
+}
+
+/// Collect properties scoped by `rdfs:domain` and edges from reference ranges.
+fn build_properties_and_edges(
+    graph: &[Value],
+    resolver: &PrefixResolver,
+    id_to_name: &HashMap<&str, &str>,
+) -> Result<(Vec<Edge>, HashMap<String, Vec<Property>>), OntologyError> {
+    let mut properties: HashMap<String, Vec<Property>> = HashMap::new();
+    let mut edges = Vec::new();
+
+    for item in graph {
+        let node_type = item.get("@type").and_then(Value::as_str).unwrap_or("");
+        if node_type != "owl:ObjectProperty" && node_type != "owl:DatatypeProperty" {
+            continue;
+        }
+
+        let label = item
+            .get("rdfs:label")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                item.get("@id").and_then(Value::as_str).map(|id| resolver.resolve(id))
+            })
+            .ok_or_else(|| {
+                OntologyError::MissingPropertyLabel(
+                    item.get("@id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>")
+                        .to_string(),
+                )
+            })?;
+
+        let description = item.get("rdfs:comment").and_then(Value::as_str).map(str::to_string);
+
+        let domain = item
+            .get("rdfs:domain")
+            .and_then(|v| v.get("@id"))
+            .and_then(Value::as_str)
+            .map(|id| resolver.resolve_iri(id))
+            .unwrap_or_default();
+
+        // Determine the range and whether it is a scalar or a reference.
+        // Scalars keep their prefixed xsd form (e.g. `xsd:string`); references
+        // are expanded to a full IRI so they can be matched against node ids.
+        let range = item.get("rdfs:range");
+        let (is_scalar, range_raw) = match range {
+            Some(Value::String(s)) => (s.starts_with(XSD_PREFIX), s.clone()),
+            Some(Value::Object(obj)) => {
+                let raw = obj
+                    .get("@id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OntologyError::InvalidJsonLd(format!(
+                            "property '{label}' has object range without '@id'"
+                        ))
+                    })?;
+                (raw.starts_with(XSD_PREFIX), raw.to_string())
+            }
+            _ => (true, "xsd:string".to_string()),
+        };
+        let range_iri = resolver.resolve_iri(&range_raw);
+
+        let property = if is_scalar {
+            Property {
+                name: label.clone(),
+                description: description.clone(),
+                range: PropertyRange::Scalar(range_raw),
+            }
+        } else {
+            // Reference range -> an edge between the domain class and the range class.
+            let target_found = id_to_name.get(range_iri.as_str()).is_some();
+            if !target_found {
+                return Err(OntologyError::UnknownReference {
+                    property: label.clone(),
+                    class: domain.clone(),
+                    reference: range_iri.clone(),
+                });
+            }
+            let to = id_to_name[range_iri.as_str()].to_string();
+            let from = id_to_name
+                .get(domain.as_str())
+                .map(|name| (*name).to_string())
+                .unwrap_or_else(|| domain.split('/').next().unwrap_or(&domain).to_string());
+
+            edges.push(Edge {
+                name: label.clone(),
+                from,
+                to,
+                description: description.clone(),
+            });
+
+            Property {
+                name: label.clone(),
+                description: description.clone(),
+                range: PropertyRange::Reference(range_iri),
+            }
+        };
+
+        if !domain.is_empty() {
+            properties.entry(domain).or_default().push(property);
+        }
+    }
+
+    Ok((edges, properties))
+}
+
+fn scalar_schema(xsd: &str) -> Value {
+    let schema_type = match xsd {
+        "xsd:integer" | "xsd:int" | "xsd:long" | "xsd:short" => "integer",
+        "xsd:decimal" | "xsd:float" | "xsd:double" => "number",
+        "xsd:boolean" => "boolean",
+        _ => "string",
+    };
+    json!({ "type": schema_type })
+}

@@ -1,0 +1,179 @@
+I want to write code in Rust that can convert the following JSON‑LD to plain JSON.  
+
+**Requirements**  
+- Nodes and edges are generated as schema.  
+- All property labels must be correct.  
+- Nodes will be defined as arrays below.  
+- Nodes will have edges as array properties.
+
+**folowing example is sample only outpu may or may not match with input**
+```jsonld
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "ex": "https://example.com/ontology/",
+
+    "Company": "ex:Company",
+    "Person": "ex:Person",
+    "Skill": "ex:Skill",
+
+    "worksFor": {
+      "@id": "ex:worksFor",
+      "@type": "@id"
+    },
+
+    "employs": {
+      "@id": "ex:employs",
+      "@type": "@id"
+    },
+
+    "hasSkill": {
+      "@id": "ex:hasSkill",
+      "@type": "@id"
+    },
+
+    "name": "schema:name",
+
+    "description": "schema:description",
+
+    "skillLevel": {
+      "@id": "ex:skillLevel",
+      "@type": "xsd:string"
+    }
+  },
+
+  "@graph": [
+    {
+      "@id": "ex:Company",
+      "@type": "owl:Class",
+      "rdfs:label": "Company",
+      "rdfs:comment": "A business or organization that employs people. A Company can have one or more employees."
+    },
+
+    {
+      "@id": "ex:Person",
+      "@type": "owl:Class",
+      "rdfs:label": "Person",
+      "rdfs:comment": "A human individual who can work for a company and have one or more skills."
+    },
+
+    {
+      "@id": "ex:Skill",
+      "@type": "owl:Class",
+      "rdfs:label": "Skill",
+      "rdfs:comment": "A capability, area of knowledge, or expertise that a person can possess, such as programming, accounting, communication, or project management."
+    },
+
+    {
+      "@id": "ex:worksFor",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "works for",
+      "rdfs:comment": "Connects a Person to the Company where that person works.",
+
+      "rdfs:domain": {
+        "@id": "ex:Person"
+      },
+
+      "rdfs:range": {
+        "@id": "ex:Company"
+      }
+    },
+
+    {
+      "@id": "ex:employs",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "employs",
+      "rdfs:comment": "Connects a Company to a Person employed by that company. This is the inverse relationship of worksFor.",
+
+      "owl:inverseOf": {
+        "@id": "ex:worksFor"
+      },
+
+      "rdfs:domain": {
+        "@id": "ex:Company"
+      },
+
+      "rdfs:range": {
+        "@id": "ex:Person"
+      }
+    },
+
+    {
+      "@id": "ex:hasSkill",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has skill",
+      "rdfs:comment": "Connects a Person to a Skill that the person possesses or has knowledge or experience in.",
+
+      "rdfs:domain": {
+        "@id": "ex:Person"
+      },
+
+      "rdfs:range": {
+        "@id": "ex:Skill"
+      }
+    },
+
+    {
+      "@id": "ex:skillLevel",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "skill level",
+      "rdfs:comment": "Describes the level of proficiency or experience a Person has. Example values may include Beginner, Intermediate, Advanced, or Expert.",
+
+      "rdfs:domain": {
+        "@id": "ex:Person"
+      },
+
+      "rdfs:range": {
+        "@id": "xsd:string"
+      }
+    }
+  ]
+}
+```
+
+output 
+```json
+{
+  "Company": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string" },
+      "description": { "type": "string" },
+      "employs": {
+        "type": "array",
+        "items": { "$ref": "#/Person" }
+      }
+    }
+  },
+
+  "Person": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string" },
+      "description": { "type": "string" },
+      "worksFor": {
+        "type": "array",
+        "items": { "$ref": "#/Company" }
+      },
+      "hasSkill": {
+        "type": "array",
+        "items": { "$ref": "#/Skill" }
+      },
+      "skillLevel": { "type": "string" }
+    }
+  },
+
+  "Skill": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string" },
+      "description": { "type": "string" }
+    }
+  }
+}
+
+```
