@@ -121,26 +121,25 @@ fn generates_keyed_schema() {
     let ontology = sample_ontology();
     let schema = ontology.to_json();
 
-    let person = &schema["NodePerson"];
+    let person = &schema["Person"];
     assert_eq!(person["type"], "object");
-    assert_eq!(person["properties"]["name"]["type"], "string");
-    assert_eq!(person["properties"]["description"]["type"], "string");
-    assert_eq!(person["properties"]["personId"]["type"], "string");
     assert_eq!(person["properties"]["worksFor"]["type"], "array");
-    assert_eq!(person["properties"]["worksFor"]["items"]["$ref"], "#/companyId");
-    assert_eq!(person["properties"]["hasSkill"]["items"]["$ref"], "#/skillId");
+    assert_eq!(person["properties"]["worksFor"]["items"]["$ref"], "#/Company");
+    assert_eq!(person["properties"]["worksFor"]["description"], json!("Person works for Company."));
+    assert_eq!(person["properties"]["hasSkill"]["items"]["$ref"], "#/Skill");
     assert_eq!(person["properties"]["skillLevel"]["type"], "string");
 
-    let company = &schema["NodeCompany"];
-    assert_eq!(company["properties"]["employs"]["items"]["$ref"], "#/personId");
+    let company = &schema["Company"];
+    assert_eq!(company["properties"]["employs"]["items"]["$ref"], "#/Person");
 
-    let skill = &schema["NodeSkill"];
-    assert_eq!(skill["properties"].as_object().map(|m| m.len()), Some(3));
+    // Only ontology-defined properties are emitted; Skill has none here.
+    let skill = &schema["Skill"];
+    assert_eq!(skill["properties"].as_object().map(|m| m.len()), Some(0));
 
-    // Each node has an id definition that edges resolve to.
-    assert_eq!(schema["personId"], json!({"type": "string", "description": "id of the node"}));
-    assert_eq!(schema["companyId"], json!({"type": "string", "description": "id of the node"}));
-    assert_eq!(schema["skillId"], json!({"type": "string", "description": "id of the node"}));
+    // Edges reference node keys directly; no separate id definitions exist.
+    assert!(schema.get("personId").is_none());
+    assert!(schema.get("companyId").is_none());
+    assert!(schema.get("skillId").is_none());
 }
 
 #[test]
@@ -180,9 +179,9 @@ fn maps_xsd_scalars_to_json_types() {
     let ontology = Ontology::from_jsonld(&value).expect("parses");
     let schema = ontology.to_json();
 
-    assert_eq!(schema["NodeRecord"]["properties"]["count"]["type"], "integer");
-    assert_eq!(schema["NodeRecord"]["properties"]["ratio"]["type"], "number");
-    assert_eq!(schema["NodeRecord"]["properties"]["active"]["type"], "boolean");
+    assert_eq!(schema["Record"]["properties"]["count"]["type"], "integer");
+    assert_eq!(schema["Record"]["properties"]["ratio"]["type"], "number");
+    assert_eq!(schema["Record"]["properties"]["active"]["type"], "boolean");
 }
 
 #[test]
@@ -218,3 +217,128 @@ fn errors_on_missing_graph() {
     let value = json!({ "@context": {} });
     assert!(matches!(Ontology::from_jsonld(&value), Err(OntologyError::MissingGraph)));
 }
+
+fn nested_ontology() -> &'static str {
+    // Mirrors the on-disk `ontology.jsonld`: classes carry a nested
+    // "properties" array and the context aliases terms rather than absolute IRIs.
+    r#"{
+        "@context": {
+            "schema": "http://schema.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "company": "schema:Organization",
+            "person": "schema:Person",
+            "skill": "schema:DefinedTerm"
+        },
+        "@graph": [
+            {
+                "@id": "company:Company",
+                "@type": "rdfs:Class",
+                "rdfs:label": "Company",
+                "rdfs:comment": "An organization that employs or is associated with persons.",
+                "properties": [
+                    { "@id": "company:name", "@type": "rdf:Property", "rdfs:label": "Company Name", "rdfs:comment": "The official name of the company." }
+                ]
+            },
+            {
+                "@id": "person:Person",
+                "@type": "rdfs:Class",
+                "rdfs:label": "Person",
+                "rdfs:comment": "An individual associated with a company and possessing skills.",
+                "properties": [
+                    { "@id": "person:name", "@type": "rdf:Property", "rdfs:label": "Person Name", "rdfs:comment": "The full name of the person." },
+                    {
+                        "@id": "person:worksFor",
+                        "@type": "rdf:Property",
+                        "rdfs:label": "Works For",
+                        "rdfs:comment": "The company the person belongs to.",
+                        "rdfs:domain": { "@id": "person:Person" },
+                        "rdfs:range": { "@id": "company:Company" }
+                    },
+                    {
+                        "@id": "person:hasSkill",
+                        "@type": "rdf:Property",
+                        "rdfs:label": "Has Skill",
+                        "rdfs:comment": "Specific skills the person possesses.",
+                        "rdfs:domain": { "@id": "person:Person" },
+                        "rdfs:range": { "@id": "skill:Skill" }
+                    }
+                ]
+            },
+            {
+                "@id": "skill:Skill",
+                "@type": "rdfs:Class",
+                "rdfs:label": "Skill",
+                "rdfs:comment": "A capability or area of knowledge.",
+                "properties": [
+                    { "@id": "skill:name", "@type": "rdf:Property", "rdfs:label": "Skill Name", "rdfs:comment": "The name of the skill, e.g., 'Python'." }
+                ]
+            }
+        ]
+    }"#
+}
+
+#[test]
+fn parses_nested_properties_format() {
+    let ontology =
+        Ontology::from_jsonld_text(nested_ontology()).expect("nested ontology parses");
+
+    assert_eq!(ontology.node_names(), vec!["Company", "Person", "Skill"]);
+    assert_eq!(ontology.edge_names(), vec!["Works For", "Has Skill"]);
+
+    let person = ontology.node("Person").expect("person node");
+    // scalar "Person Name", reference "Works For" (Company), reference "Has Skill" (Skill)
+    assert_eq!(person.properties.len(), 3);
+    assert_eq!(person.properties[0].name, "Person Name");
+    assert!(matches!(person.properties[0].range, PropertyRange::Scalar(_)));
+    assert_eq!(person.properties[1].name, "Works For");
+    assert_eq!(
+        person.properties[1].range,
+        PropertyRange::Reference("http://schema.org/Organization/Company".to_string())
+    );
+    assert_eq!(person.properties[2].name, "Has Skill");
+    assert_eq!(
+        person.properties[2].range,
+        PropertyRange::Reference("http://schema.org/DefinedTerm/Skill".to_string())
+    );
+
+    // Scalar properties on Company and Skill.
+    assert_eq!(
+        ontology.node("Company").expect("company node").properties.len(),
+        1
+    );
+    assert_eq!(
+        ontology.node("Skill").expect("skill node").properties.len(),
+        1
+    );
+
+    let schema = ontology.to_json();
+    assert_eq!(
+        schema["Company"]["description"],
+        json!("An organization that employs or is associated with persons.")
+    );
+    assert_eq!(
+        schema["Person"]["description"],
+        json!("An individual associated with a company and possessing skills.")
+    );
+    assert_eq!(
+        schema["Person"]["properties"]["Works For"]["items"]["$ref"],
+        "#/Company"
+    );
+    assert_eq!(
+        schema["Person"]["properties"]["Has Skill"]["items"]["$ref"],
+        "#/Skill"
+    );
+    assert_eq!(
+        schema["Company"]["properties"]["Company Name"]["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["Company"]["properties"]["Company Name"]["description"],
+        json!("The official name of the company.")
+    );
+    assert_eq!(
+        schema["Person"]["properties"]["Works For"]["description"],
+        json!("The company the person belongs to.")
+    );
+}
+

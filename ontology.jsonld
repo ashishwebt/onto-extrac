@@ -1,0 +1,69 @@
+{
+  "@context": {
+    "schema": "http://schema.org/",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "company": "schema:Organization",
+    "person": "schema:Person",
+    "skill": "schema:DefinedTerm"
+  },
+  "@graph": [
+    {
+      "@id": "company:Company",
+      "@type": "rdfs:Class",
+      "rdfs:label": "Company",
+      "rdfs:comment": "An organization that employs or is associated with persons.",
+      "properties": [
+        {
+          "@id": "company:name",
+          "@type": "rdf:Property",
+          "rdfs:label": "CompanyName",
+          "rdfs:comment": "The official name of the company."
+        }
+      ]
+    },
+    {
+      "@id": "person:Person",
+      "@type": "rdfs:Class",
+      "rdfs:label": "Person",
+      "rdfs:comment": "An individual associated with a company and possessing skills.",
+      "properties": [
+        {
+          "@id": "person:name",
+          "@type": "rdf:Property",
+          "rdfs:label": "PersonName",
+          "rdfs:comment": "The full name of the person."
+        },
+        {
+          "@id": "person:worksFor",
+          "@type": "rdf:Property",
+          "rdfs:label": "WorksFor",
+          "rdfs:comment": "The company the person belongs to.",
+          "rdfs:domain": { "@id": "person:Person" },
+          "rdfs:range": { "@id": "company:Company" }
+        },
+        {
+          "@id": "person:hasSkill",
+          "@type": "rdf:Property",
+          "rdfs:label": "HasSkill",
+          "rdfs:comment": "Specific skills the person possesses.",
+          "rdfs:domain": { "@id": "person:Person" },
+          "rdfs:range": { "@id": "skill:Skill" }
+        }
+      ]
+    },
+    {
+      "@id": "skill:Skill",
+      "@type": "rdfs:Class",
+      "rdfs:label": "Skill",
+      "rdfs:comment": "A capability or area of knowledge.",
+      "properties": [
+        {
+          "@id": "skill:name",
+          "@type": "rdf:Property",
+          "rdfs:label": "SkillName",
+          "rdfs:comment": "The name of the skill, e.g., 'Python'."
+        }
+      ]
+    }
+  ]
+}

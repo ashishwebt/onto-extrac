@@ -83,6 +83,7 @@ pub enum OntologyError {
 
 const RDFS_CLASS: &str = "rdfs:Class";
 const OWL_CLASS: &str = "owl:Class";
+const RDF_PROPERTY: &str = "rdf:Property";
 const XSD_PREFIX: &str = "xsd:";
 
 impl Ontology {
@@ -142,11 +143,30 @@ impl Ontology {
 
         let resolver = PrefixResolver::new(context);
 
-        // First pass: collect class nodes.
+        // First pass: collect class nodes, and hoist any properties nested
+        // under a class's "properties" array into standalone property entries
+        // (domain defaults to the containing class when not specified).
         let mut nodes = Vec::new();
+        let mut nested_properties = Vec::new();
         for item in graph {
             if is_class(item) {
                 nodes.push(parse_node(item, &resolver)?);
+                let class_id = item.get("@id").and_then(Value::as_str);
+                if let Some(props) = item.get("properties").and_then(Value::as_array) {
+                    for prop in props {
+                        let mut entry = prop.clone();
+                        if let Some(id) = class_id {
+                            let has_domain = entry
+                                .get("rdfs:domain")
+                                .map(|d| !d.is_null())
+                                .unwrap_or(false);
+                            if !has_domain {
+                                entry["rdfs:domain"] = json!({ "@id": id });
+                            }
+                        }
+                        nested_properties.push(entry);
+                    }
+                }
             }
         }
 
@@ -159,9 +179,15 @@ impl Ontology {
             .map(|node| (node.id.as_str(), node.name.as_str()))
             .collect();
 
+        // Combine any free-standing property entries with the nested ones so
+        // both formats are handled by the same code path.
+        let mut property_entries: Vec<Value> = nested_properties;
+        property_entries.extend(graph.iter().cloned());
+
         // Second pass: derive edges from reference-type properties, and map
-        // any free-standing object/datatype properties onto their domain class.
-        let (edges, properties) = build_properties_and_edges(graph, &resolver, &id_to_name)?;
+        // any object/datatype properties onto their domain class.
+        let (edges, properties) =
+            build_properties_and_edges(&property_entries, &resolver, &id_to_name)?;
 
         // Attach domain-scoped properties to nodes.
         for node in &mut nodes {
@@ -177,60 +203,56 @@ impl Ontology {
     // Schema generation
     // -----------------------------------------------------------------------
 
+    /// Build a property schema with its `rdfs:comment` attached as `description`.
+    fn with_description(schema: Value, property: &Property) -> Value {
+        let mut schema = schema;
+        if let Some(description) = &property.description {
+            schema["description"] = json!(description);
+        }
+        schema
+    }
+
     /// Convert the ontology into the flat keyed JSON schema form described in
     /// `req.md` (one object property per node, with edges referencing the
-    /// other node by id instead of embedding the full object).
+    /// other node by name instead of embedding the full object).
     pub fn to_json(&self) -> Value {
         let mut output: Map<String, Value> = Map::new();
 
-        // Node id helpers. A node named "Person" gets top-level key
-        // "NodePerson", an id field "personId", and an id definition
-        // "NodePersonId".
-        let node_key = |name: &str| format!("Node{name}");
-        let node_id_key = |name: &str| {
-            let first = name.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
-            format!("{first}{}Id", &name[name.len().min(first.len())..])
-        };
-
         for node in &self.nodes {
             let mut props: Map<String, Value> = Map::new();
-            props.insert("name".to_string(), json!({"type": "string"}));
-            props.insert("description".to_string(), json!({"type": "string"}));
-            props.insert(node_id_key(&node.name), json!({"type": "string"}));
 
             for property in &node.properties {
                 match &property.range {
                     PropertyRange::Scalar(xsd) => {
-                        props.insert(property.name.clone(), scalar_schema(xsd));
+                        props.insert(
+                            property.name.clone(),
+                            Self::with_description(scalar_schema(xsd), property),
+                        );
                     }
                     PropertyRange::Reference(target) => {
-                        if let Some(node) = self.nodes.iter().find(|n| n.id == *target) {
-                            // Edge carries the id of the target node rather
+                        if let Some(target_node) = self.nodes.iter().find(|n| n.id == *target) {
+                            // Edge carries a reference to the target node rather
                             // than the full object.
                             props.insert(
                                 property.name.clone(),
-                                json!({
-                                    "type": "array",
-                                    "items": { "$ref": format!("#/{}", node_id_key(&node.name)) }
-                                }),
+                                Self::with_description(
+                                    json!({
+                                        "type": "array",
+                                        "items": { "$ref": format!("#/{}", target_node.name) }
+                                    }),
+                                    property,
+                                ),
                             );
                         }
                     }
                 }
             }
 
-            output.insert(
-                node_key(&node.name),
-                json!({ "type": "object", "properties": props }),
-            );
-        }
-
-        // Emit an id definition for each node so edges can resolve to it.
-        for node in &self.nodes {
-            output.insert(
-                node_id_key(&node.name),
-                json!({ "type": "string", "description": "id of the node" }),
-            );
+            let mut node_schema = json!({ "type": "object", "properties": props });
+            if let Some(description) = &node.description {
+                node_schema["description"] = json!(description);
+            }
+            output.insert(node.name.clone(), node_schema);
         }
 
         Value::Object(output)
@@ -244,7 +266,11 @@ impl Ontology {
 
 /// Resolves prefixed terms (e.g. `ex:Person`) to full IRIs and back to short names.
 struct PrefixResolver {
+    /// Direct prefix -> absolute IRI base (e.g. `schema` -> `http://schema.org/`).
     prefixes: HashMap<String, String>,
+    /// Term alias -> term mapping (e.g. `company` -> `schema:Organization`).
+    aliases: HashMap<String, String>,
+    /// Full IRI -> short (context key) name.
     short_names: HashMap<String, String>,
 }
 
@@ -252,6 +278,7 @@ impl PrefixResolver {
     fn new(context: Option<&Map<String, Value>>) -> Self {
         let mut resolver = PrefixResolver {
             prefixes: HashMap::new(),
+            aliases: HashMap::new(),
             short_names: HashMap::new(),
         };
 
@@ -259,16 +286,19 @@ impl PrefixResolver {
             return resolver;
         };
 
-        // First pass: collect prefix declarations. A term maps to a prefix only
-        // when its value is an absolute IRI (e.g. "ex": "https://example.com/").
+        // First pass: collect prefix declarations and term aliases. A term that
+        // is not itself prefixed is treated as a namespace prefix; its value is
+        // either an absolute IRI (a direct prefix) or another term (an alias).
         for (key, val) in context {
             if let Value::String(s) = val {
-                let is_prefix = key.split_once(':').is_none();
-                let is_absolute = s.starts_with("http") || s.starts_with("https");
-                if is_prefix && is_absolute {
-                    resolver
-                        .prefixes
-                        .insert(key.clone(), s.trim_end_matches('/').to_string() + "/");
+                if key.split_once(':').is_none() {
+                    if s.starts_with("http") || s.starts_with("https") {
+                        resolver
+                            .prefixes
+                            .insert(key.clone(), s.trim_end_matches('/').to_string() + "/");
+                    } else {
+                        resolver.aliases.insert(key.clone(), s.clone());
+                    }
                 }
             }
         }
@@ -295,9 +325,27 @@ impl PrefixResolver {
         resolver
     }
 
+    /// Resolve a namespace prefix to an absolute IRI base ending in `/`. Direct
+    /// prefixes are used as-is; aliases are expanded recursively through the
+    /// prefix table.
+    fn resolve_base(&self, prefix: &str) -> Option<String> {
+        if let Some(base) = self.prefixes.get(prefix) {
+            return Some(base.clone());
+        }
+        if let Some(alias) = self.aliases.get(prefix) {
+            return self
+                .expand(alias)
+                .map(|iri| iri.trim_end_matches('/').to_string() + "/");
+        }
+        None
+    }
+
     fn expand(&self, term: &str) -> Option<String> {
+        if term.starts_with("http://") || term.starts_with("https://") {
+            return Some(term.to_string());
+        }
         term.split_once(':')
-            .and_then(|(prefix, local)| self.prefixes.get(prefix).map(|base| format!("{base}{local}")))
+            .and_then(|(prefix, local)| self.resolve_base(prefix).map(|base| format!("{base}{local}")))
     }
 
     /// Expand `term` to a full IRI, falling back to the raw term.
@@ -364,7 +412,10 @@ fn build_properties_and_edges(
 
     for item in graph {
         let node_type = item.get("@type").and_then(Value::as_str).unwrap_or("");
-        if node_type != "owl:ObjectProperty" && node_type != "owl:DatatypeProperty" {
+        if node_type != "owl:ObjectProperty"
+            && node_type != "owl:DatatypeProperty"
+            && node_type != RDF_PROPERTY
+        {
             continue;
         }
 
