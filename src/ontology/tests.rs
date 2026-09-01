@@ -94,11 +94,13 @@ fn derives_edges_from_object_properties() {
     assert_eq!(works_for.name, "worksFor");
     assert_eq!(works_for.from, "Person");
     assert_eq!(works_for.to, "Company");
+    assert!(works_for.properties.is_empty());
 
     let employs = &ontology.edges[1];
     assert_eq!(employs.name, "employs");
     assert_eq!(employs.from, "Company");
     assert_eq!(employs.to, "Person");
+    assert!(employs.properties.is_empty());
 }
 
 #[test]
@@ -107,7 +109,7 @@ fn attaches_domain_properties_to_nodes() {
 
     let person = ontology.node("Person").expect("person node");
     assert_eq!(person.properties.len(), 3);
-    assert_eq!(person.properties[0].range, PropertyRange::Reference("https://example.com/ontology/Company".to_string()));
+    assert_eq!(person.properties[0].range, PropertyRange::Reference("worksFor".to_string()));
     assert!(matches!(person.properties[1].range, PropertyRange::Reference(_)));
     assert_eq!(person.properties[2].range, PropertyRange::Scalar("xsd:string".to_string()));
 
@@ -124,22 +126,28 @@ fn generates_keyed_schema() {
     let person = &schema["Person"];
     assert_eq!(person["type"], "object");
     assert_eq!(person["properties"]["worksFor"]["type"], "array");
-    assert_eq!(person["properties"]["worksFor"]["items"]["$ref"], "#/Company");
+    assert_eq!(person["properties"]["worksFor"]["items"]["$ref"], "#/worksFor");
     assert_eq!(person["properties"]["worksFor"]["description"], json!("Person works for Company."));
-    assert_eq!(person["properties"]["hasSkill"]["items"]["$ref"], "#/Skill");
+    assert_eq!(person["properties"]["hasSkill"]["items"]["$ref"], "#/hasSkill");
     assert_eq!(person["properties"]["skillLevel"]["type"], "string");
 
     let company = &schema["Company"];
-    assert_eq!(company["properties"]["employs"]["items"]["$ref"], "#/Person");
+    assert_eq!(company["properties"]["employs"]["items"]["$ref"], "#/employs");
 
-    // Only ontology-defined properties are emitted; Skill has none here.
-    let skill = &schema["Skill"];
-    assert_eq!(skill["properties"].as_object().map(|m| m.len()), Some(0));
+    // Edges are now top-level entries with source/target.
+    let works_for_edge = &schema["worksFor"];
+    assert_eq!(works_for_edge["type"], "object");
+    assert_eq!(works_for_edge["properties"]["source"]["$ref"], "#/Person");
+    assert_eq!(works_for_edge["properties"]["target"]["$ref"], "#/Company");
+    assert_eq!(works_for_edge["description"], json!("Person works for Company."));
 
-    // Edges reference node keys directly; no separate id definitions exist.
-    assert!(schema.get("personId").is_none());
-    assert!(schema.get("companyId").is_none());
-    assert!(schema.get("skillId").is_none());
+    let employs_edge = &schema["employs"];
+    assert_eq!(employs_edge["properties"]["source"]["$ref"], "#/Company");
+    assert_eq!(employs_edge["properties"]["target"]["$ref"], "#/Person");
+
+    let has_skill_edge = &schema["hasSkill"];
+    assert_eq!(has_skill_edge["properties"]["source"]["$ref"], "#/Person");
+    assert_eq!(has_skill_edge["properties"]["target"]["$ref"], "#/Skill");
 }
 
 #[test]
@@ -293,12 +301,12 @@ fn parses_nested_properties_format() {
     assert_eq!(person.properties[1].name, "Works For");
     assert_eq!(
         person.properties[1].range,
-        PropertyRange::Reference("http://schema.org/Organization/Company".to_string())
+        PropertyRange::Reference("Works For".to_string())
     );
     assert_eq!(person.properties[2].name, "Has Skill");
     assert_eq!(
         person.properties[2].range,
-        PropertyRange::Reference("http://schema.org/DefinedTerm/Skill".to_string())
+        PropertyRange::Reference("Has Skill".to_string())
     );
 
     // Scalar properties on Company and Skill.
@@ -322,11 +330,11 @@ fn parses_nested_properties_format() {
     );
     assert_eq!(
         schema["Person"]["properties"]["Works For"]["items"]["$ref"],
-        "#/Company"
+        "#/Works For"
     );
     assert_eq!(
         schema["Person"]["properties"]["Has Skill"]["items"]["$ref"],
-        "#/Skill"
+        "#/Has Skill"
     );
     assert_eq!(
         schema["Company"]["properties"]["Company Name"]["type"],
@@ -339,6 +347,24 @@ fn parses_nested_properties_format() {
     assert_eq!(
         schema["Person"]["properties"]["Works For"]["description"],
         json!("The company the person belongs to.")
+    );
+
+    // Edges are top-level entries.
+    assert_eq!(
+        schema["Works For"]["properties"]["source"]["$ref"],
+        "#/Person"
+    );
+    assert_eq!(
+        schema["Works For"]["properties"]["target"]["$ref"],
+        "#/Company"
+    );
+    assert_eq!(
+        schema["Has Skill"]["properties"]["source"]["$ref"],
+        "#/Person"
+    );
+    assert_eq!(
+        schema["Has Skill"]["properties"]["target"]["$ref"],
+        "#/Skill"
     );
 }
 

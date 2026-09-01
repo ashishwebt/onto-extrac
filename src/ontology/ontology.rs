@@ -34,12 +34,14 @@ pub enum PropertyRange {
 }
 
 /// A directed relationship between two nodes, derived from an object property.
+/// An edge can carry its own scalar properties (e.g. `skillLevel` on `hasSkill`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Edge {
     pub name: String,
     pub from: String,
     pub to: String,
     pub description: Option<String>,
+    pub properties: Vec<Property>,
 }
 
 /// The parsed ontology: a set of nodes and the edges between them.
@@ -213,8 +215,8 @@ impl Ontology {
     }
 
     /// Convert the ontology into the flat keyed JSON schema form described in
-    /// `req.md` (one object property per node, with edges referencing the
-    /// other node by name instead of embedding the full object).
+    /// `req.md` (one object property per node, with edges as top-level entries
+    /// carrying `source`/`target` refs and their own properties).
     pub fn to_json(&self) -> Value {
         let mut output: Map<String, Value> = Map::new();
 
@@ -229,21 +231,17 @@ impl Ontology {
                             Self::with_description(scalar_schema(xsd), property),
                         );
                     }
-                    PropertyRange::Reference(target) => {
-                        if let Some(target_node) = self.nodes.iter().find(|n| n.id == *target) {
-                            // Edge carries a reference to the target node rather
-                            // than the full object.
-                            props.insert(
-                                property.name.clone(),
-                                Self::with_description(
-                                    json!({
-                                        "type": "array",
-                                        "items": { "$ref": format!("#/{}", target_node.name) }
-                                    }),
-                                    property,
-                                ),
-                            );
-                        }
+                    PropertyRange::Reference(edge_name) => {
+                        props.insert(
+                            property.name.clone(),
+                            Self::with_description(
+                                json!({
+                                    "type": "array",
+                                    "items": { "$ref": format!("#/{}", edge_name) }
+                                }),
+                                property,
+                            ),
+                        );
                     }
                 }
             }
@@ -253,6 +251,37 @@ impl Ontology {
                 node_schema["description"] = json!(description);
             }
             output.insert(node.name.clone(), node_schema);
+        }
+
+        for edge in &self.edges {
+            let mut edge_props: Map<String, Value> = Map::new();
+
+            edge_props.insert(
+                "source".to_string(),
+                json!({ "$ref": format!("#/{}", edge.from) }),
+            );
+            edge_props.insert(
+                "target".to_string(),
+                json!({ "$ref": format!("#/{}", edge.to) }),
+            );
+
+            for property in &edge.properties {
+                match &property.range {
+                    PropertyRange::Scalar(xsd) => {
+                        edge_props.insert(
+                            property.name.clone(),
+                            Self::with_description(scalar_schema(xsd), property),
+                        );
+                    }
+                    PropertyRange::Reference(_) => {}
+                }
+            }
+
+            let mut edge_schema = json!({ "type": "object", "properties": edge_props });
+            if let Some(description) = &edge.description {
+                edge_schema["description"] = json!(description);
+            }
+            output.insert(edge.name.clone(), edge_schema);
         }
 
         Value::Object(output)
@@ -401,6 +430,65 @@ fn parse_node(item: &Value, resolver: &PrefixResolver) -> Result<Node, OntologyE
     })
 }
 
+/// Extract scalar properties nested under an edge/property entry's `"properties"`
+/// array.  These become the edge's own metadata (e.g. `skillLevel` on `hasSkill`).
+fn extract_edge_properties(
+    item: &Value,
+    resolver: &PrefixResolver,
+) -> Result<Vec<Property>, OntologyError> {
+    let nested = match item.get("properties").and_then(Value::as_array) {
+        Some(arr) => arr,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut edge_props = Vec::new();
+    for prop in nested {
+        let label = prop
+            .get("rdfs:label")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                prop.get("@id")
+                    .and_then(Value::as_str)
+                    .map(|id| resolver.resolve(id))
+            })
+            .ok_or_else(|| {
+                OntologyError::MissingPropertyLabel(
+                    prop.get("@id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unknown>")
+                        .to_string(),
+                )
+            })?;
+
+        let description = prop.get("rdfs:comment").and_then(Value::as_str).map(str::to_string);
+
+        let range = prop.get("rdfs:range");
+        let (is_scalar, range_raw) = match range {
+            Some(Value::String(s)) => (s.starts_with(XSD_PREFIX), s.clone()),
+            Some(Value::Object(obj)) => {
+                let raw = obj.get("@id").and_then(Value::as_str).ok_or_else(|| {
+                    OntologyError::InvalidJsonLd(format!(
+                        "edge property '{label}' has object range without '@id'"
+                    ))
+                })?;
+                (raw.starts_with(XSD_PREFIX), raw.to_string())
+            }
+            _ => (true, "xsd:string".to_string()),
+        };
+
+        if is_scalar {
+            edge_props.push(Property {
+                name: label,
+                description,
+                range: PropertyRange::Scalar(range_raw),
+            });
+        }
+    }
+
+    Ok(edge_props)
+}
+
 /// Collect properties scoped by `rdfs:domain` and edges from reference ranges.
 fn build_properties_and_edges(
     graph: &[Value],
@@ -465,6 +553,8 @@ fn build_properties_and_edges(
         };
         let range_iri = resolver.resolve_iri(&range_raw);
 
+        let edge_properties = extract_edge_properties(item, resolver)?;
+
         let property = if is_scalar {
             Property {
                 name: label.clone(),
@@ -492,12 +582,13 @@ fn build_properties_and_edges(
                 from,
                 to,
                 description: description.clone(),
+                properties: edge_properties,
             });
 
             Property {
                 name: label.clone(),
                 description: description.clone(),
-                range: PropertyRange::Reference(range_iri),
+                range: PropertyRange::Reference(label.clone()),
             }
         };
 
