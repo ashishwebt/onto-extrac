@@ -1,7 +1,7 @@
 use std::env;
 use std::io::Write;
 
-use onto_extra::{BamlExtractor, Extractor, Ontology};
+use onto_extra::{BamlExtractor, CypherAdapter, Extractor, Ontology, PersistenceAdapter};
 
 fn usage() -> ! {
     eprintln!("usage: onto_extra <ontology.jsonld> [<text>]");
@@ -66,4 +66,14 @@ fn main() {
         std::process::exit(1);
     });
     println!("{}", serde_json::to_string_pretty(&value).expect("serialize"));
+
+    // Stage 4: generate Cypher queries from the extracted data.
+    println!("\n=== Cypher Queries ===");
+    let cypher = CypherAdapter::new(&ontology);
+    let queries = cypher.generate_queries(&value);
+    if queries.is_empty() {
+        println!("(no Cypher queries generated)");
+    } else {
+        println!("{queries}");
+    }
 }

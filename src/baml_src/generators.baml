@@ -7,7 +7,7 @@ generator target {
     output_dir "../"
 
     // The version of the BAML package you have installed
-    version "0.221.0"
+    version "0.226.1"
 
     // Valid values: "sync", "async"
     default_client_mode sync

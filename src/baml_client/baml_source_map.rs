@@ -15,11 +15,11 @@ pub fn get_baml_files() -> &'static HashMap<String, String> {
     FILE_MAP.get_or_init(|| {
         let mut m = HashMap::new();
 
-        m.insert("clients.baml".to_string(), "client CustomGemini {\n  provider google-ai\n  options {\n    model gemini-3.6-flash\n    api_key env.GOOGLE_API_KEY\n  }\n}\n".to_string());
+        m.insert("clients.baml".to_string(), "client<llm> CustomGemini {\n  provider google-ai\n  options {\n    model \"gemini-3.6-flash\"\n    api_key env.GOOGLE_API_KEY\n  }\n}\n".to_string());
 
         m.insert("generated_ontology.baml".to_string(), "class ExtractionResult {\n  status bool @description(#\"\n    Extraction status\n  \"#)\n  @@dynamic\n}\n\nfunction ExtractInfo(input: string) -> ExtractionResult {\n  client \"CustomGemini\"\n  prompt #\"\n    Extract structured information from the following text based on the requested schema.\n\n    {{ ctx.output_format }}\n\n    {{ _.role(\"user\") }} {{ input }}\n  \"#\n}\n".to_string());
 
-        m.insert("generators.baml".to_string(), "// Generator config for the Rust BAML client.\ngenerator target {\n    // Valid values: \"python/pydantic\", \"typescript\", \"go\", \"rust\", \"ruby/sorbet\", \"rest/openapi\"\n    output_type \"rust\"\n\n    // Where the generated code will be saved (relative to baml_src/)\n    output_dir \"../\"\n\n    // The version of the BAML package you have installed\n    version \"0.221.0\"\n\n    // Valid values: \"sync\", \"async\"\n    default_client_mode sync\n}\n".to_string());
+        m.insert("generators.baml".to_string(), "// Generator config for the Rust BAML client.\ngenerator target {\n    // Valid values: \"python/pydantic\", \"typescript\", \"go\", \"rust\", \"ruby/sorbet\", \"rest/openapi\"\n    output_type \"rust\"\n\n    // Where the generated code will be saved (relative to baml_src/)\n    output_dir \"../\"\n\n    // The version of the BAML package you have installed\n    version \"0.226.1\"\n\n    // Valid values: \"sync\", \"async\"\n    default_client_mode sync\n}\n".to_string());
 
         m
     })
