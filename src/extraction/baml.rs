@@ -48,6 +48,15 @@ impl<'a> BamlExtractor<'a> {
         for node in &nodes_sorted {
             output.push_str(&format!("class {} {{\n", node.name));
             output.push_str("  id string\n");
+            let id_desc = match &node.description {
+                Some(desc) => format!(
+                    "A unique identifier for this {} entity. {}",
+                    node.name,
+                    desc.replace('#', "\\#").replace('"', "\\\"")
+                ),
+                None => format!("A unique identifier for this {} entity.", node.name),
+            };
+            output.push_str(&format!("  @description(#\"{}\"#)\n", id_desc));
 
             for property in &node.properties {
                 let ty = self.map_property_type(property);
