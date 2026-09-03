@@ -119,35 +119,37 @@ fn attaches_domain_properties_to_nodes() {
 }
 
 #[test]
-fn generates_keyed_schema() {
+fn generates_defs_schema() {
     let ontology = sample_ontology();
     let schema = ontology.to_json();
 
-    let person = &schema["Person"];
+    // The document is wrapped in a "$defs" map.
+    let defs = schema["$defs"].as_object().expect("schema has $defs");
+    assert!(defs.contains_key("Person"));
+    assert!(defs.contains_key("Company"));
+    assert!(defs.contains_key("Skill"));
+    assert!(defs.contains_key("EntityRef"));
+
+    // Each class is a JSON object schema with an id property.
+    let person = &schema["$defs"]["Person"];
     assert_eq!(person["type"], "object");
-    assert_eq!(person["properties"]["worksFor"]["type"], "array");
-    assert_eq!(person["properties"]["worksFor"]["items"]["$ref"], "#/worksFor");
+    assert_eq!(person["properties"]["id"]["type"], "string");
+
+    // Object-to-object references use the shared EntitiesRef.
+    assert_eq!(person["properties"]["worksFor"]["$ref"], "#/$defs/EntityRef");
     assert_eq!(person["properties"]["worksFor"]["description"], json!("Person works for Company."));
-    assert_eq!(person["properties"]["hasSkill"]["items"]["$ref"], "#/hasSkill");
+    assert_eq!(person["properties"]["hasSkill"]["$ref"], "#/$defs/EntityRef");
     assert_eq!(person["properties"]["skillLevel"]["type"], "string");
 
-    let company = &schema["Company"];
-    assert_eq!(company["properties"]["employs"]["items"]["$ref"], "#/employs");
+    let company = &schema["$defs"]["Company"];
+    assert_eq!(company["properties"]["employs"]["$ref"], "#/$defs/EntityRef");
 
-    // Edges are now top-level entries with source/target.
-    let works_for_edge = &schema["worksFor"];
-    assert_eq!(works_for_edge["type"], "object");
-    assert_eq!(works_for_edge["properties"]["source"]["$ref"], "#/Person");
-    assert_eq!(works_for_edge["properties"]["target"]["$ref"], "#/Company");
-    assert_eq!(works_for_edge["description"], json!("Person works for Company."));
-
-    let employs_edge = &schema["employs"];
-    assert_eq!(employs_edge["properties"]["source"]["$ref"], "#/Company");
-    assert_eq!(employs_edge["properties"]["target"]["$ref"], "#/Person");
-
-    let has_skill_edge = &schema["hasSkill"];
-    assert_eq!(has_skill_edge["properties"]["source"]["$ref"], "#/Person");
-    assert_eq!(has_skill_edge["properties"]["target"]["$ref"], "#/Skill");
+    // EntityRef is a lightweight id + type object with both required.
+    let entity_ref = &schema["$defs"]["EntityRef"];
+    assert_eq!(entity_ref["type"], "object");
+    assert_eq!(entity_ref["properties"]["id"]["type"], "string");
+    assert_eq!(entity_ref["properties"]["type"]["type"], "string");
+    assert_eq!(entity_ref["required"], json!(["id", "type"]));
 }
 
 #[test]
@@ -187,9 +189,10 @@ fn maps_xsd_scalars_to_json_types() {
     let ontology = Ontology::from_jsonld(&value).expect("parses");
     let schema = ontology.to_json();
 
-    assert_eq!(schema["Record"]["properties"]["count"]["type"], "integer");
-    assert_eq!(schema["Record"]["properties"]["ratio"]["type"], "number");
-    assert_eq!(schema["Record"]["properties"]["active"]["type"], "boolean");
+    let record = &schema["$defs"]["Record"];
+    assert_eq!(record["properties"]["count"]["type"], "integer");
+    assert_eq!(record["properties"]["ratio"]["type"], "number");
+    assert_eq!(record["properties"]["active"]["type"], "boolean");
 }
 
 #[test]
@@ -321,50 +324,36 @@ fn parses_nested_properties_format() {
 
     let schema = ontology.to_json();
     assert_eq!(
-        schema["Company"]["description"],
+        schema["$defs"]["Company"]["description"],
         json!("An organization that employs or is associated with persons.")
     );
     assert_eq!(
-        schema["Person"]["description"],
+        schema["$defs"]["Person"]["description"],
         json!("An individual associated with a company and possessing skills.")
     );
     assert_eq!(
-        schema["Person"]["properties"]["Works For"]["items"]["$ref"],
-        "#/Works For"
+        schema["$defs"]["Person"]["properties"]["Works For"]["$ref"],
+        "#/$defs/EntityRef"
     );
     assert_eq!(
-        schema["Person"]["properties"]["Has Skill"]["items"]["$ref"],
-        "#/Has Skill"
+        schema["$defs"]["Person"]["properties"]["Has Skill"]["$ref"],
+        "#/$defs/EntityRef"
     );
     assert_eq!(
-        schema["Company"]["properties"]["Company Name"]["type"],
+        schema["$defs"]["Company"]["properties"]["Company Name"]["type"],
         "string"
     );
     assert_eq!(
-        schema["Company"]["properties"]["Company Name"]["description"],
+        schema["$defs"]["Company"]["properties"]["Company Name"]["description"],
         json!("The official name of the company.")
     );
     assert_eq!(
-        schema["Person"]["properties"]["Works For"]["description"],
+        schema["$defs"]["Person"]["properties"]["Works For"]["description"],
         json!("The company the person belongs to.")
     );
-
-    // Edges are top-level entries.
     assert_eq!(
-        schema["Works For"]["properties"]["source"]["$ref"],
-        "#/Person"
-    );
-    assert_eq!(
-        schema["Works For"]["properties"]["target"]["$ref"],
-        "#/Company"
-    );
-    assert_eq!(
-        schema["Has Skill"]["properties"]["source"]["$ref"],
-        "#/Person"
-    );
-    assert_eq!(
-        schema["Has Skill"]["properties"]["target"]["$ref"],
-        "#/Skill"
+        schema["$defs"]["EntityRef"]["required"],
+        json!(["id", "type"])
     );
 }
 

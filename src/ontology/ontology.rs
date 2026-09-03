@@ -214,14 +214,17 @@ impl Ontology {
         schema
     }
 
-    /// Convert the ontology into the flat keyed JSON schema form described in
-    /// `req.md` (one object property per node, with edges as top-level entries
-    /// carrying `source`/`target` refs and their own properties).
+    /// Convert the ontology into a standard JSON Schema document. Each class
+    /// becomes an entry under `$defs`; object-to-object references are emitted
+    /// as a `$ref` to a shared lightweight `EntityRef` (a small `id` + `type`
+    /// object) rather than embedding or inlining the full target definition.
     pub fn to_json(&self) -> Value {
-        let mut output: Map<String, Value> = Map::new();
+        let mut defs: Map<String, Value> = Map::new();
 
         for node in &self.nodes {
             let mut props: Map<String, Value> = Map::new();
+
+            props.insert("id".to_string(), json!({ "type": "string" }));
 
             for property in &node.properties {
                 match &property.range {
@@ -231,14 +234,11 @@ impl Ontology {
                             Self::with_description(scalar_schema(xsd), property),
                         );
                     }
-                    PropertyRange::Reference(edge_name) => {
+                    PropertyRange::Reference(_) => {
                         props.insert(
                             property.name.clone(),
                             Self::with_description(
-                                json!({
-                                    "type": "array",
-                                    "items": { "$ref": format!("#/{}", edge_name) }
-                                }),
+                                json!({ "$ref": "#/$defs/EntityRef" }),
                                 property,
                             ),
                         );
@@ -250,41 +250,23 @@ impl Ontology {
             if let Some(description) = &node.description {
                 node_schema["description"] = json!(description);
             }
-            output.insert(node.name.clone(), node_schema);
+            defs.insert(node.name.clone(), node_schema);
         }
 
-        for edge in &self.edges {
-            let mut edge_props: Map<String, Value> = Map::new();
+        // A lightweight reference used wherever a class points to another class.
+        defs.insert(
+            "EntityRef".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "type": { "type": "string" }
+                },
+                "required": ["id", "type"]
+            }),
+        );
 
-            edge_props.insert(
-                "source".to_string(),
-                json!({ "$ref": format!("#/{}", edge.from) }),
-            );
-            edge_props.insert(
-                "target".to_string(),
-                json!({ "$ref": format!("#/{}", edge.to) }),
-            );
-
-            for property in &edge.properties {
-                match &property.range {
-                    PropertyRange::Scalar(xsd) => {
-                        edge_props.insert(
-                            property.name.clone(),
-                            Self::with_description(scalar_schema(xsd), property),
-                        );
-                    }
-                    PropertyRange::Reference(_) => {}
-                }
-            }
-
-            let mut edge_schema = json!({ "type": "object", "properties": edge_props });
-            if let Some(description) = &edge.description {
-                edge_schema["description"] = json!(description);
-            }
-            output.insert(edge.name.clone(), edge_schema);
-        }
-
-        Value::Object(output)
+        json!({ "$defs": defs })
     }
 
     /// Convert the ontology into a pretty-printed JSON string.
