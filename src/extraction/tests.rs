@@ -136,3 +136,64 @@ fn generated_schema_is_valid_baml() {
     let tb = crate::baml_client::TypeBuilder::new();
     assert!(tb.add_baml(&schema).is_ok(), "schema should be valid BAML:\n{schema}");
 }
+
+fn is_uuid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 5
+        && parts.iter().all(|p| {
+            !p.is_empty() && p.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
+#[test]
+fn replaces_llm_ids_with_uuids_and_keeps_refs_consistent() {
+    // Mirrors what the LLM returns: string ids plus EntityRef references.
+    let mut payload = json!({
+        "person": [
+            {
+                "id": "person-1",
+                "PersonName": "Alice",
+                "WorksFor": { "id": "company-1", "type": "Company" },
+                "HasSkill": { "id": "skill-1", "type": "Skill" }
+            },
+            {
+                "id": "person-2",
+                "PersonName": "Bob",
+                "WorksFor": { "id": "company-1", "type": "Company" }
+            }
+        ],
+        "company": [{ "id": "company-1", "CompanyName": "Acme" }],
+        "skill": [{ "id": "skill-1", "SkillName": "Rust" }]
+    });
+
+    BamlExtractor::assign_uuids(&mut payload);
+
+    let person_1 = &payload["person"][0];
+    let person_2 = &payload["person"][1];
+    let company = &payload["company"][0];
+    let skill = &payload["skill"][0];
+
+    let person_1_id = person_1["id"].as_str().unwrap();
+    let person_2_id = person_2["id"].as_str().unwrap();
+    let company_id = company["id"].as_str().unwrap();
+    let skill_id = skill["id"].as_str().unwrap();
+
+    // Every id is now a UUID, not the original placeholder string.
+    assert!(is_uuid(person_1_id));
+    assert!(is_uuid(person_2_id));
+    assert!(is_uuid(company_id));
+    assert!(is_uuid(skill_id));
+    assert_ne!(person_1_id, person_2_id);
+
+    // References point at the same (remapped) uuids as their targets.
+    assert_eq!(person_1["WorksFor"]["id"].as_str(), Some(company_id));
+    assert_eq!(person_2["WorksFor"]["id"].as_str(), Some(company_id));
+    assert_eq!(person_1["HasSkill"]["id"].as_str(), Some(skill_id));
+
+    // Target type names are preserved.
+    assert_eq!(person_1["WorksFor"]["type"].as_str(), Some("Company"));
+
+    // Scalar data is untouched.
+    assert_eq!(person_1["PersonName"], json!("Alice"));
+    assert_eq!(company["CompanyName"], json!("Acme"));
+}

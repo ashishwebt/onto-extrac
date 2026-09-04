@@ -9,6 +9,8 @@
 use crate::baml_client::{B, TypeBuilder};
 use crate::ontology::{Ontology, PropertyRange};
 use serde_json::Value;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Errors that can occur while generating the BAML schema or extracting.
 #[derive(Debug, thiserror::Error)]
@@ -147,6 +149,92 @@ impl<'a> BamlExtractor<'a> {
         }
         out
     }
+
+    /// Replace every entity's LLM-generated string id with a fresh UUID and
+    /// rewrite every `EntityRef` so references keep pointing at the same target.
+    /// This must run before the payload is persisted so graph nodes and edges
+    /// share stable, collision-free identifiers.
+    pub(crate) fn assign_uuids(payload: &mut Value) {
+        let Value::Object(entities) = payload else {
+            return;
+        };
+
+        // Pass 1: collect every entity id, mapping each to a new UUID.
+        let mut id_map: HashMap<String, String> = HashMap::new();
+        for records in entities.values() {
+            for record in Self::records(records) {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    id_map
+                        .entry(id.to_string())
+                        .or_insert_with(|| Uuid::new_v4().to_string());
+                }
+            }
+        }
+
+        // Pass 2: swap entity ids and rewrite EntityRef references in place.
+        for records in entities.values_mut() {
+            for record in Self::records_mut(records) {
+                let Some(object) = record.as_object_mut() else {
+                    continue;
+                };
+                if let Some(old_id) = object.get("id").and_then(Value::as_str)
+                    && let Some(new_id) = id_map.get(old_id)
+                {
+                    object.insert("id".to_string(), Value::String(new_id.clone()));
+                }
+                // Rewrite EntityRef objects nested anywhere inside the record.
+                for member in object.values_mut() {
+                    Self::remap_ref_ids(member, &id_map);
+                }
+            }
+        }
+    }
+
+    /// Recursively rewrite the `id` of any `EntityRef`-shaped object
+    /// (`{ "id": ..., "type": ... }`) using `id_map`. Other values are left
+    /// untouched.
+    fn remap_ref_ids(value: &mut Value, id_map: &HashMap<String, String>) {
+        match value {
+            Value::Object(object) => {
+                if object.contains_key("type") {
+                    if let Some(id) = object.get("id").and_then(Value::as_str)
+                        && let Some(new_id) = id_map.get(id)
+                    {
+                        object.insert("id".to_string(), Value::String(new_id.clone()));
+                    }
+                    return;
+                }
+                for member in object.values_mut() {
+                    Self::remap_ref_ids(member, id_map);
+                }
+            }
+            Value::Array(array) => {
+                for member in array.iter_mut() {
+                    Self::remap_ref_ids(member, id_map);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Iterate the records of a node array: either an array of entities or a
+    /// single entity object.
+    fn records(value: &Value) -> Vec<&Value> {
+        match value {
+            Value::Array(values) => values.iter().collect(),
+            Value::Object(_) => vec![value],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Iterate the records of a node array mutably.
+    fn records_mut(value: &mut Value) -> Box<dyn Iterator<Item = &mut Value> + '_> {
+        match value {
+            Value::Array(array) => Box::new(array.iter_mut()),
+            Value::Object(_) => Box::new(std::iter::once(value)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
 }
 
 impl super::Extractor for BamlExtractor<'_> {
@@ -158,7 +246,10 @@ impl super::Extractor for BamlExtractor<'_> {
 
         let res = B.ExtractInfo.with_type_builder(&tb).call(text)?;
 
-        let value = serde_json::to_value(&res)?;
+        let mut value = serde_json::to_value(&res)?;
+        // Swap the LLM's placeholder ids for stable UUIDs while keeping every
+        // EntityRef reference pointing at the same target.
+        Self::assign_uuids(&mut value);
         Ok(value)
     }
 }
