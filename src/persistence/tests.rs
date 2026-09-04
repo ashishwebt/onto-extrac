@@ -39,7 +39,7 @@ fn sample_ontology() -> Ontology {
 }
 
 #[test]
-fn generates_merge_for_each_node() {
+fn generates_unwind_merge_for_nodes() {
     let ontology = sample_ontology();
     let adapter = CypherAdapter::new(&ontology);
 
@@ -51,12 +51,14 @@ fn generates_merge_for_each_node() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (n:Person { id: \"p1\" });"));
-    assert!(cypher.contains("MERGE (n:Person { id: \"p2\" });"));
+    assert!(cypher.contains("UNWIND [") && cypher.contains("AS record"));
+    assert!(cypher.contains("MERGE (n:Person { id: record.id })"));
+    assert!(cypher.contains("ON CREATE SET n += record"));
+    assert!(cypher.contains("ON MATCH SET n += record"));
 }
 
 #[test]
-fn sets_scalar_properties_excluding_id() {
+fn sets_properties_via_record_spread() {
     let ontology = sample_ontology();
     let adapter = CypherAdapter::new(&ontology);
 
@@ -65,10 +67,10 @@ fn sets_scalar_properties_excluding_id() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    // Properties are sorted alphabetically by serde_json's BTreeMap.
-    assert!(cypher.contains("SET n += { age: 30, name: \"Alice\" };"));
-    // id should not appear inside the SET clause
-    assert!(!cypher.contains("SET n += { age: 30, id:"));
+    // Properties are spread from the record map, so they appear in the UNWIND list.
+    assert!(cypher.contains("age: 30"));
+    assert!(cypher.contains("name: \"Alice\""));
+    assert!(cypher.contains("ON CREATE SET n += record"));
 }
 
 #[test]
@@ -82,9 +84,9 @@ fn generates_edge_merge_between_related_nodes() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (a)-[:worksFor]->(b);"));
-    assert!(cypher.contains("MATCH (a:Person { id: \"p1\" }),"));
-    assert!(cypher.contains("(b:Company { id: \"c1\" })"));
+    assert!(cypher.contains("[:worksFor]"));
+    assert!(cypher.contains("MATCH (a:Person { id: edge.childId }),"));
+    assert!(cypher.contains("(b:Company { id: edge.parentId })"));
 }
 
 #[test]
@@ -98,7 +100,7 @@ fn falls_back_to_related_to_for_unknown_pairs() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (a)-[:RELATED_TO]->(b);"));
+    assert!(cypher.contains("[:RELATED_TO]"));
 }
 
 #[test]
@@ -139,7 +141,46 @@ fn escapes_quotes_in_string_values() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("name: \"Alice \\\"The Great\\\"\""));
+    assert!(cypher.contains("Alice \\\"The Great\\\""));
+}
+
+#[test]
+fn escapes_newlines_in_string_values() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "bio": "Line one\nLine two" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    assert!(cypher.contains("Line one\\nLine two"));
+}
+
+#[test]
+fn escapes_backslashes_in_string_values() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "path": "C:\\Users\\test" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    assert!(cypher.contains("C:\\\\Users\\\\test"));
+}
+
+#[test]
+fn escapes_tabs_in_string_values() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "data": "col1\tcol2" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    assert!(cypher.contains("col1\\tcol2"));
 }
 
 #[test]
@@ -154,9 +195,9 @@ fn multiple_entity_types_in_payload() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (n:Person { id: \"p1\" });"));
-    assert!(cypher.contains("MERGE (n:Company { id: \"c1\" });"));
-    assert!(cypher.contains("MERGE (n:Skill { id: \"s1\" });"));
+    assert!(cypher.contains("MERGE (n:Person { id: record.id })"));
+    assert!(cypher.contains("MERGE (n:Company { id: record.id })"));
+    assert!(cypher.contains("MERGE (n:Skill { id: record.id })"));
 }
 
 #[test]
@@ -190,10 +231,11 @@ fn handles_array_payload() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (n:Person { id: \"p1\" });"));
-    assert!(cypher.contains("SET n += { name: \"Alice\" };"));
-    assert!(cypher.contains("MERGE (n:Person { id: \"p2\" });"));
-    assert!(cypher.contains("SET n += { name: \"Bob\" };"));
+    // Both records are in the same UNWIND block.
+    assert!(cypher.contains("id: \"p1\""));
+    assert!(cypher.contains("name: \"Alice\""));
+    assert!(cypher.contains("id: \"p2\""));
+    assert!(cypher.contains("name: \"Bob\""));
 }
 
 #[test]
@@ -206,6 +248,107 @@ fn handles_single_object_payload() {
     });
 
     let cypher = adapter.generate_queries(&payload);
-    assert!(cypher.contains("MERGE (n:Person { id: \"p1\" });"));
-    assert!(cypher.contains("SET n += { name: \"Alice\" };"));
+    assert!(cypher.contains("MERGE (n:Person { id: record.id })"));
+    assert!(cypher.contains("name: \"Alice\""));
+}
+
+#[test]
+fn single_record_uses_unwind() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "name": "Alice" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    // Even a single record uses UNWIND for consistency.
+    assert!(cypher.contains("UNWIND ["));
+    assert!(cypher.contains("AS record"));
+}
+
+#[test]
+fn multiple_relationship_types_produce_separate_unwind_blocks() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [
+            { "id": "p1", "parent_source_ids": ["c1", "s1"] }
+        ],
+        "Company": [{ "id": "c1" }],
+        "Skill": [{ "id": "s1" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    // Two relationship types produce two separate UNWIND blocks.
+    let unwind_count = cypher.matches("UNWIND [").count();
+    // 3 node UNWINDs (Person, Company, Skill) + 2 edge UNWINDs (worksFor, hasSkill) = 5
+    assert_eq!(unwind_count, 5);
+    assert!(cypher.contains("[:worksFor]"));
+    assert!(cypher.contains("[:hasSkill]"));
+}
+
+#[test]
+fn batched_nodes_share_single_unwind() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [
+            { "id": "p1", "name": "Alice" },
+            { "id": "p2", "name": "Bob" },
+            { "id": "p3", "name": "Carol" }
+        ]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    // All three Person records should be in one UNWIND block.
+    let unwind_count = cypher.matches("UNWIND [").count();
+    assert_eq!(unwind_count, 1);
+    assert!(cypher.contains("id: \"p1\""));
+    assert!(cypher.contains("id: \"p2\""));
+    assert!(cypher.contains("id: \"p3\""));
+}
+
+#[test]
+fn edge_unwind_uses_correct_labels() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "parent_source_ids": ["c1"] }],
+        "Company": [{ "id": "c1" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    // The MATCH should use Person for a and Company for b.
+    assert!(cypher.contains("MATCH (a:Person { id: edge.childId }),"));
+    assert!(cypher.contains("(b:Company { id: edge.parentId })"));
+}
+
+#[test]
+fn null_values_are_preserved() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "nickname": null }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    assert!(cypher.contains("nickname: null"));
+}
+
+#[test]
+fn boolean_values_are_preserved() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    let payload = json!({
+        "Person": [{ "id": "p1", "active": true }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+    assert!(cypher.contains("active: true"));
 }

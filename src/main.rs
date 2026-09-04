@@ -1,79 +1,193 @@
-use std::env;
-use std::io::Write;
+use std::sync::Arc;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use onto_extra::{
+    BamlExtractor, CypherAdapter, Extractor, Neo4jClient, Ontology, PersistenceAdapter,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
-use onto_extra::{BamlExtractor, CypherAdapter, Extractor, Ontology, PersistenceAdapter};
-
-fn usage() -> ! {
-    eprintln!("usage: onto_extra <ontology.jsonld> [<text>]");
-    std::process::exit(1)
+struct AppState {
+    ontology: Ontology,
+    neo4j: Neo4jClient,
 }
 
-fn load_ontology(path: &str) -> Ontology {
-    let onto = Ontology::from_file(path).unwrap_or_else(|err| {
-        eprintln!("error: {err}");
-        std::process::exit(1);
-    });
-    onto.validate().unwrap_or_else(|err| {
-        eprintln!("error: {err}");
-        std::process::exit(1);
-    });
-    onto
+#[derive(Deserialize, utoipa::ToSchema)]
+struct ExtractRequest {
+    /// Text to extract entities and relations from
+    text: String,
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("error: missing ontology path");
-        usage();
+#[derive(Deserialize, utoipa::ToSchema)]
+struct CypherRequest {
+    /// Cypher statements to execute
+    statements: Vec<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ExtractResponse {
+    /// Extracted entities and relations
+    extracted: Value,
+    /// Generated Cypher query
+    cypher: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct GraphResponse {
+    /// Graph nodes from Neo4j
+    nodes: Vec<Value>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct CypherResponse {
+    /// Result from Cypher execution
+    result: Value,
+}
+
+/// Extract entities and relations from text using BAML
+#[utoipa::path(
+    post,
+    path = "/extract",
+    request_body = ExtractRequest,
+    responses(
+        (status = 200, description = "Extraction result", body = ExtractResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn extract_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ExtractRequest>,
+) -> Result<Json<ExtractResponse>, (StatusCode, String)> {
+    let extractor = BamlExtractor::new(&state.ontology);
+    let extracted = extractor
+        .extract(&payload.text)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("extraction error: {e}")))?;
+
+    let adapter = CypherAdapter::new(&state.ontology);
+    let cypher = adapter.generate_queries(&extracted);
+
+    if !cypher.is_empty() {
+        state
+            .neo4j
+            .execute(&cypher)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("neo4j error: {e}")))?;
     }
 
-    let ontology_path = &args[1];
-    let ontology = load_ontology(ontology_path);
+    Ok(Json(ExtractResponse { extracted, cypher }))
+}
 
-    // Stage 1: print the JSON Schema derived from the ontology.
-    println!("=== JSON Schema ===");
-    let schema = ontology.to_json_pretty().expect("failed to serialize");
-    println!("{schema}");
+/// Execute Cypher statements against Neo4j
+#[utoipa::path(
+    post,
+    path = "/cypher",
+    request_body = CypherRequest,
+    responses(
+        (status = 200, description = "Execution result", body = CypherResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn cypher_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CypherRequest>,
+) -> Result<Json<CypherResponse>, (StatusCode, String)> {
+    let combined = payload.statements.join(";\n");
+    let result = state
+        .neo4j
+        .execute(&combined)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("neo4j error: {e}")))?;
 
-    // Stage 2: print the dynamic BAML classes derived from the ontology.
-    let extractor = BamlExtractor::new(&ontology);
-    let baml_schema = extractor.generate_schema();
-    println!("\n=== BAML Classes ===");
-    println!("{baml_schema}");
+    Ok(Json(CypherResponse { result }))
+}
 
-    // Stage 3: (optional) extract entities from the given text.
-    let text = match args.get(2) {
-        None => {
-            std::io::stdout().flush().ok();
-            eprintln!("\n(no text provided; skipping extraction)");
-            return;
-        }
-        Some(arg) if arg == "--file" => {
-            let path = args.get(3).expect("missing file path after --file");
-            std::fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!("error reading '{path}': {e}");
-                std::process::exit(1);
-            })
-        }
-        Some(arg) => arg.clone(),
-    };
+/// Fetch all nodes from the graph
+#[utoipa::path(
+    get,
+    path = "/graph",
+    responses(
+        (status = 200, description = "Graph nodes", body = GraphResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn graph_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<GraphResponse>, (StatusCode, String)> {
+    let nodes = state
+        .neo4j
+        .fetch_all()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("neo4j error: {e}")))?;
 
+    Ok(Json(GraphResponse { nodes }))
+}
+
+/// Health check endpoint
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses((status = 200, description = "OK"))
+)]
+async fn health_handler() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(extract_handler, cypher_handler, graph_handler, health_handler),
+    components(schemas(ExtractRequest, ExtractResponse, CypherRequest, CypherResponse, GraphResponse))
+)]
+struct ApiDoc;
+
+#[tokio::main]
+async fn main() {
     dotenvy::dotenv().ok();
 
-    println!("\n=== Extraction ===");
-    let value = extractor.extract(&text).unwrap_or_else(|e| {
-        eprintln!("extraction error: {e}");
+    let ontology_path =
+        std::env::var("ONTOLOGY_PATH").unwrap_or_else(|_| "ontology.jsonld".into());
+    let neo4j_uri =
+        std::env::var("NEO4J_URI").unwrap_or_else(|_| "http://localhost:7474".into());
+    let neo4j_user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+    let neo4j_pass =
+        std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "letmein123".into());
+    let listen_addr =
+        std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3200".into());
+
+    let ontology = Ontology::from_file(&ontology_path).unwrap_or_else(|err| {
+        eprintln!("error loading ontology: {err}");
         std::process::exit(1);
     });
-    println!("{}", serde_json::to_string_pretty(&value).expect("serialize"));
+    ontology.validate().unwrap_or_else(|err| {
+        eprintln!("error validating ontology: {err}");
+        std::process::exit(1);
+    });
 
-    // Stage 4: generate Cypher queries from the extracted data.
-    println!("\n=== Cypher Queries ===");
-    let cypher = CypherAdapter::new(&ontology);
-    let queries = cypher.generate_queries(&value);
-    if queries.is_empty() {
-        println!("(no Cypher queries generated)");
-    } else {
-        println!("{queries}");
-    }
+    let neo4j = Neo4jClient::new(&neo4j_uri, &neo4j_user, &neo4j_pass);
+
+    let state = Arc::new(AppState { ontology, neo4j });
+
+    let app = Router::new()
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(health_handler))
+        .route("/extract", post(extract_handler))
+        .route("/cypher", post(cypher_handler))
+        .route("/graph", get(graph_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&listen_addr)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("error binding to {listen_addr}: {err}");
+            std::process::exit(1);
+        });
+
+    println!("listening on {listen_addr}");
+    println!("OpenAPI spec available at http://{listen_addr}/openapi.json");
+    axum::serve(listener, app).await.unwrap();
 }
