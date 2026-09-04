@@ -81,6 +81,13 @@ impl<'a> BamlExtractor<'a> {
             output.push_str("}\n\n");
         }
 
+        output.push_str("class EntityRef {\n");
+        output.push_str("  id string\n");
+        output.push_str("  @description(#\"The id of the referenced entity\"#)\n");
+        output.push_str("  type string\n");
+        output.push_str("  @description(#\"The type (class name) of the referenced entity, e.g. Company, Skill\"#)\n");
+        output.push_str("}\n\n");
+
         output.push_str("dynamic class ExtractionResult {\n");
 
         for node in &nodes_sorted {
@@ -99,13 +106,13 @@ impl<'a> BamlExtractor<'a> {
     }
 
     /// Map a property to a BAML type. Scalar XSD types are mapped via the
-    /// ontology's JSON Schema mapping rules; references become the target class
-    /// name (rendered as a compact `EntityRef`-like object), mirroring how the
-    /// JSON Schema output represents references.
+    /// ontology's JSON Schema mapping rules; references become an `EntityRef`
+    /// object (the target class id + type), mirroring how the JSON Schema
+    /// output represents references.
     fn map_property_type(&self, property: &crate::ontology::Property) -> String {
         match &property.range {
             PropertyRange::Scalar(xsd) => Self::map_scalar(xsd),
-            PropertyRange::Reference(_) => "string".to_string(),
+            PropertyRange::Reference(_) => "EntityRef".to_string(),
         }
     }
 

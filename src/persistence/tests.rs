@@ -79,7 +79,7 @@ fn generates_edge_merge_between_related_nodes() {
     let adapter = CypherAdapter::new(&ontology);
 
     let payload = json!({
-        "Person": [{ "id": "p1", "parent_source_ids": ["c1"] }],
+        "Person": [{ "id": "p1", "worksFor": { "id": "c1", "type": "Company" } }],
         "Company": [{ "id": "c1", "CompanyName": "Acme" }]
     });
 
@@ -95,7 +95,7 @@ fn falls_back_to_related_to_for_unknown_pairs() {
     let adapter = CypherAdapter::new(&ontology);
 
     let payload = json!({
-        "Company": [{ "id": "c1", "parent_source_ids": ["p1"] }],
+        "Company": [{ "id": "c1", "worksFor": { "id": "p1", "type": "Person" } }],
         "Person": [{ "id": "p1" }]
     });
 
@@ -207,7 +207,11 @@ fn uses_ontology_edge_names_for_relationships() {
 
     let payload = json!({
         "Person": [
-            { "id": "p1", "parent_source_ids": ["c1", "s1"] }
+            {
+                "id": "p1",
+                "worksFor": { "id": "c1", "type": "Company" },
+                "hasSkill": { "id": "s1", "type": "Skill" }
+            }
         ],
         "Company": [{ "id": "c1" }],
         "Skill": [{ "id": "s1" }]
@@ -216,6 +220,43 @@ fn uses_ontology_edge_names_for_relationships() {
     let cypher = adapter.generate_queries(&payload);
     assert!(cypher.contains("[:worksFor]"));
     assert!(cypher.contains("[:hasSkill]"));
+}
+
+#[test]
+fn canonicalizes_lowercased_payload_labels() {
+    let ontology = sample_ontology();
+    let adapter = CypherAdapter::new(&ontology);
+
+    // Mirrors what the BAML extractor actually returns: node arrays are keyed
+    // by the lowercased class name (person, company, skill) while EntityRef
+    // `type` values use the capitalized ontology class name (Company, Skill).
+    let payload = json!({
+        "person": [
+            {
+                "id": "p1",
+                "name": "Alice",
+                "worksFor": { "id": "c1", "type": "Company" },
+                "hasSkill": { "id": "s1", "type": "Skill" }
+            }
+        ],
+        "company": [{ "id": "c1", "CompanyName": "Acme" }],
+        "skill": [{ "id": "s1", "SkillName": "Rust" }]
+    });
+
+    let cypher = adapter.generate_queries(&payload);
+
+    // Nodes are MERGEd with canonical (ontology) labels.
+    assert!(cypher.contains("MERGE (n:Person { id: record.id })"), "{cypher}");
+    assert!(cypher.contains("MERGE (n:Company { id: record.id })"), "{cypher}");
+    assert!(cypher.contains("MERGE (n:Skill { id: record.id })"), "{cypher}");
+
+    // Edges MATCH canonical labels and resolve the real relationship names.
+    assert!(cypher.contains("MATCH (a:Person { id: edge.childId }),"), "{cypher}");
+    assert!(cypher.contains("(b:Company { id: edge.parentId })"), "{cypher}");
+    assert!(cypher.contains("(b:Skill { id: edge.parentId })"), "{cypher}");
+    assert!(cypher.contains("[:worksFor]"), "{cypher}");
+    assert!(cypher.contains("[:hasSkill]"), "{cypher}");
+    assert!(!cypher.contains("[:RELATED_TO]"), "{cypher}");
 }
 
 #[test]
@@ -274,7 +315,11 @@ fn multiple_relationship_types_produce_separate_unwind_blocks() {
 
     let payload = json!({
         "Person": [
-            { "id": "p1", "parent_source_ids": ["c1", "s1"] }
+            {
+                "id": "p1",
+                "worksFor": { "id": "c1", "type": "Company" },
+                "hasSkill": { "id": "s1", "type": "Skill" }
+            }
         ],
         "Company": [{ "id": "c1" }],
         "Skill": [{ "id": "s1" }]
@@ -317,7 +362,7 @@ fn edge_unwind_uses_correct_labels() {
     let adapter = CypherAdapter::new(&ontology);
 
     let payload = json!({
-        "Person": [{ "id": "p1", "parent_source_ids": ["c1"] }],
+        "Person": [{ "id": "p1", "worksFor": { "id": "c1", "type": "Company" } }],
         "Company": [{ "id": "c1" }]
     });
 

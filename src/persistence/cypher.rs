@@ -3,9 +3,12 @@ use std::collections::HashMap;
 use crate::ontology::Ontology;
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct CypherAdapter {
     /// Maps `(from_label, to_label)` -> relationship name, derived from ontology edges.
     rel_types: HashMap<(String, String), String>,
+    /// Lowercased label -> canonical node name (e.g. "company" -> "Company").
+    label_aliases: HashMap<String, String>,
 }
 
 impl CypherAdapter {
@@ -16,13 +19,51 @@ impl CypherAdapter {
                 .entry((edge.from.clone(), edge.to.clone()))
                 .or_insert_with(|| edge.name.clone());
         }
-        Self { rel_types }
+        let mut label_aliases = HashMap::new();
+        for node in &ontology.nodes {
+            label_aliases
+                .entry(node.name.to_ascii_lowercase())
+                .or_insert_with(|| node.name.clone());
+        }
+        Self { rel_types, label_aliases }
+    }
+
+    /// Resolve a payload label to the ontology's canonical node name, matching
+    /// case-insensitively. Extraction lowercases the class names into payload
+    /// keys (e.g. `Person` -> `person`), so labels must be normalized back to
+    /// the ontology spelling for node creation, edge matching, and relationship
+    /// type lookup to line up.
+    fn canonical_label(&self, label: &str) -> String {
+        self.label_aliases
+            .get(&label.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| label.to_string())
     }
 
     fn records(value: &Value) -> Vec<&Value> {
         match value {
             Value::Array(values) => values.iter().collect(),
             Value::Object(_) => vec![value],
+            _ => Vec::new(),
+        }
+    }
+
+    /// `true` if the value is a single `EntityRef`-style object (has `id` and
+    /// `type` keys) but not a plain scalar map.
+    fn is_entity_ref(value: &Value) -> bool {
+        match value {
+            Value::Object(obj) => obj.contains_key("id") && obj.contains_key("type"),
+            _ => false,
+        }
+    }
+
+    /// Extract `EntityRef`-style objects from a property value. Accepts a
+    /// single `{ "id": ..., "type": ... }` object or an array of such objects.
+    /// Returns an empty vec for anything else.
+    fn entity_refs(value: &Value) -> Vec<&Value> {
+        match value {
+            Value::Object(_) => vec![value],
+            Value::Array(values) => values.iter().collect(),
             _ => Vec::new(),
         }
     }
@@ -100,14 +141,6 @@ impl CypherAdapter {
     }
 }
 
-impl Default for CypherAdapter {
-    fn default() -> Self {
-        Self {
-            rel_types: HashMap::new(),
-        }
-    }
-}
-
 impl super::PersistenceAdapter for CypherAdapter {
     fn generate_queries(&self, payload: &Value) -> String {
         let Value::Object(entities) = payload else {
@@ -141,15 +174,19 @@ impl super::PersistenceAdapter for CypherAdapter {
                 continue;
             }
 
-            let safe_label = Self::sanitize_identifier(label);
+            let safe_label = Self::sanitize_identifier(&self.canonical_label(label));
 
             // Build the list of maps for UNWIND.
             let maps: Vec<String> = valid_records
                 .iter()
                 .map(|record| {
                     let obj = record.as_object().unwrap();
+                    // Exclude reference-typed properties (`EntityRef` objects,
+                    // which represent graph edges rather than node properties)
+                    // from the node property map.
                     let entries: Vec<String> = obj
                         .iter()
+                        .filter(|(_, v)| !Self::is_entity_ref(v))
                         .map(|(k, v)| {
                             format!(
                                 "{}: {}",
@@ -173,8 +210,10 @@ impl super::PersistenceAdapter for CypherAdapter {
 
         // --- Phase 3: MERGE edges (batched by label pair with UNWIND) ---
         // Group edge data by (child_label, parent_label) for one UNWIND per
-        // distinct relationship type.
-        let mut edge_groups: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
+        // distinct relationship type. Edges are derived from reference-typed
+        // properties whose value is an `EntityRef`-style object
+        // (`{ "id": ..., "type": ... }`) or an array of such objects.
+        let mut edge_groups: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
 
         for (label, records) in entities {
             for record in Self::records(records) {
@@ -186,23 +225,29 @@ impl super::PersistenceAdapter for CypherAdapter {
                     continue;
                 };
 
-                let Some(Value::Array(parents)) = object.get("parent_source_ids") else {
-                    continue;
-                };
-
-                for parent in parents {
-                    let Some(parent_id) = parent.as_str() else {
+                for (key, value) in object {
+                    if key == "id" {
                         continue;
-                    };
-
-                    let Some(parent_label) = ids.get(parent_id) else {
-                        continue;
-                    };
-
-                    edge_groups
-                        .entry((label.as_str(), parent_label.as_str()))
-                        .or_default()
-                        .push((id, parent_id));
+                    }
+                    for entity_ref in Self::entity_refs(value) {
+                        let Some(parent_id) = entity_ref.get("id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Some(parent_label) = entity_ref
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .or_else(|| ids.get(parent_id).map(String::as_str))
+                        else {
+                            continue;
+                        };
+                        edge_groups
+                            .entry((
+                                self.canonical_label(label),
+                                self.canonical_label(parent_label),
+                            ))
+                            .or_default()
+                            .push((id.to_string(), parent_id.to_string()));
+                    }
                 }
             }
         }

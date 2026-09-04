@@ -87,9 +87,44 @@ fn maps_xsd_scalars_to_baml_types() {
 fn adds_id_field_to_every_entity() {
     let ontology = sample_ontology();
     let schema = BamlExtractor::new(&ontology).generate_schema();
-    // Each entity class should carry a stable `id string` field.
-    let count = schema.matches("  id string\n").count();
+    // Each entity class should carry a stable `id string` field. The EntityRef
+    // class also has one, so count id fields only on entity classes (the ones
+    // appearing before the EntityRef class definition).
+    let entity_part = &schema[..schema.find("class EntityRef").unwrap()];
+    let count = entity_part.matches("  id string\n").count();
     assert_eq!(count, ontology.nodes.len(), "schema:\n{schema}");
+}
+
+#[test]
+fn maps_reference_properties_to_entity_ref() {
+    let ontology = json!({
+        "@context": {
+            "schema": "https://schema.org/",
+            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "xsd": "http://www.w3.org/2001/XMLSchema#",
+            "ex": "https://example.com/ontology/",
+            "Company": "ex:Company",
+            "Person": "ex:Person"
+        },
+        "@graph": [
+            { "@id": "ex:Company", "@type": "owl:Class", "rdfs:label": "Company" },
+            { "@id": "ex:Person", "@type": "owl:Class", "rdfs:label": "Person" },
+            {
+                "@id": "ex:worksFor",
+                "@type": "owl:ObjectProperty",
+                "rdfs:label": "worksFor",
+                "rdfs:domain": { "@id": "ex:Person" },
+                "rdfs:range": { "@id": "ex:Company" }
+            }
+        ]
+    });
+    let ontology = Ontology::from_jsonld(&ontology).expect("valid ontology");
+    let schema = BamlExtractor::new(&ontology).generate_schema();
+
+    assert!(schema.contains("class EntityRef {"), "schema:\n{schema}");
+    assert!(schema.contains("  worksFor EntityRef"), "schema:\n{schema}");
 }
 
 #[test]
