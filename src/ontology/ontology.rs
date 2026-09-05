@@ -301,15 +301,15 @@ impl PrefixResolver {
         // is not itself prefixed is treated as a namespace prefix; its value is
         // either an absolute IRI (a direct prefix) or another term (an alias).
         for (key, val) in context {
-            if let Value::String(s) = val {
-                if key.split_once(':').is_none() {
-                    if s.starts_with("http") || s.starts_with("https") {
-                        resolver
-                            .prefixes
-                            .insert(key.clone(), s.trim_end_matches('/').to_string() + "/");
-                    } else {
-                        resolver.aliases.insert(key.clone(), s.clone());
-                    }
+            if let Value::String(s) = val
+                && key.split_once(':').is_none()
+            {
+                if s.starts_with("http") || s.starts_with("https") {
+                    resolver
+                        .prefixes
+                        .insert(key.clone(), s.trim_end_matches('/').to_string() + "/");
+                } else {
+                    resolver.aliases.insert(key.clone(), s.clone());
                 }
             }
         }
@@ -323,10 +323,10 @@ impl PrefixResolver {
                     }
                 }
                 Value::Object(obj) => {
-                    if let Some(id_str) = obj.get("@id").and_then(Value::as_str) {
-                        if let Some(full) = resolver.expand(id_str) {
-                            resolver.short_names.insert(full, key.clone());
-                        }
+                    if let Some(id_str) = obj.get("@id").and_then(Value::as_str)
+                        && let Some(full) = resolver.expand(id_str)
+                    {
+                        resolver.short_names.insert(full, key.clone());
                     }
                 }
                 _ => {}
