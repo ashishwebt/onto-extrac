@@ -1,0 +1,15 @@
+@baseUrl = http://localhost:3200
+
+### Health
+GET {{baseUrl}}/health
+
+### Extract
+POST {{baseUrl}}/extract
+Content-Type: application/json
+
+{
+  "text": "Jenna Ortega works at Netflix as an actress, and Prime works there as a developer. Jensen Huang works at Nvidia; he is a communicator."
+}
+
+### Graph
+GET {{baseUrl}}/graph
