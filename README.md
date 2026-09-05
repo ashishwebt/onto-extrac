@@ -1,5 +1,7 @@
 # onto-extrac
 
+[日本語](./README.ja.md)
+
 `onto-extrac` is a Rust web service that extracts entities and relationships from free text according to a user-defined ontology, and persists the result as a knowledge graph in Neo4j.
 
 You describe your domain as a JSON-LD ontology (classes, properties, and relations), point the service at some text, and it:
